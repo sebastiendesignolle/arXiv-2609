@@ -1,49 +1,12 @@
 """
 Symmetry-reduced universal-parent SOS hierarchy.
 
-This single module constructs and solves only the symmetry-reduced SDP for
-`k` projective measurements with `n` outcomes at SOS level `1 <= t`.
-The last outcome of every measurement is eliminated, and the exact marginal
-word sieve is always applied.  The full reconstruction isometry for every
-Wedderburn component is stored, so reduced numerical blocks can be lifted back
-to the original Gram matrices with `reconstruct_gram_matrices`.
+The module constructs the universal SOS relaxation for `k` projective measurements with `n` outcomes at level `t`.
+The last outcome of each measurement is eliminated algebraically, the marginal SOS basis is reduced by an exact
+retraction, and the remaining Gram matrices are block diagonalised under the relevant permutation symmetries.
 
-The implementation uses a length-parametric `Word{L}` type.  Operations that
-preserve or predict the word length use `ntuple(..., Val(L))`, allowing the
-compiler to infer concrete word lengths whenever the calling context permits.
-
-The reduced model is always exported to sparse SDPA `.dat-s` format and then
-read back as the geometric-form solver model.  This avoids the numerically less
-stable direct standard-form construction with PSD variables and many equality
-constraints.  Coefficients are printed in the active scalar type, including
-arbitrary-precision `BigFloat` decimals.
-
-Required packages:
-
-    import Pkg
-    Pkg.activate(".")
-    Pkg.up()
-
-Typical use:
-
-    include("universal_parent_sos_symmetrized.jl")
-    using .SymmetrizedParentSOS
-
-    setprecision(BigFloat, 256) do
-        problem = solve_symmetrized_parent_sdp(
-            BigFloat;
-            n = 4,
-            k = 3,
-            t = 3,
-            save_path = "parent_k3_n4_t3.dat",
-        )
-
-        Q, K = reconstruct_gram_matrices(
-            problem.reduction,
-            problem.result.Q_blocks,
-            problem.result.K_blocks,
-        )
-    end
+The reduced SDP is exported in sparse SDPA `.dat-s` format. It can either be solved immediately with
+`solve_symmetrized_parent_sdp` or solved later, without rebuilding the hierarchy, with `solve_dat_s`.
 """
 module SymmetrizedParentSOS
 
@@ -51,58 +14,19 @@ using GenericLinearAlgebra
 import Hypatia
 using JuMP
 using LinearAlgebra
-using PolynomialRoots
 using Random
 using Serialization
 using SparseArrays
 
-export Word,
-    setting_of,
-    outcome_of,
-    concrete_letter,
-    reduce_abstract,
-    reduce_concrete,
-    abstract_words,
-    concrete_words,
-    marginal_allowed_letters,
-    marginal_residual_basis,
-    build_abstract_gram_map,
-    build_coefficient_data,
-    SymmetryComponent,
-    SymmetryDecomposition,
-    ParentSymmetryReduction,
-    CompactCoefficientData,
-    compact_reduction,
-    ReducedNormalisationEquation,
-    ReducedMarginalEquation,
-    block_signature,
-    full_isometry,
-    setting_generators,
-    normalisation_generators,
-    marginal_generators,
-    basis_permutations,
-    orbit_partition,
-    word_orbit_partition,
-    symmetric_pair_orbits,
-    stable_svd,
-    decompose_permutation_representation,
-    decomposition_error_scale,
-    recommended_hypatia_rank_tolerance,
-    zero_visibility_feasibility_diagnostics,
-    reconstruct_matrix,
-    compress_matrix,
+export build_symmetrized_parent_sdp,
+    solve_symmetrized_parent_sdp,
+    solve_dat_s,
     reconstruct_gram_matrices,
     save_reduction,
     load_reduction,
-    build_parent_symmetry_reduction,
-    reduced_row_blocks,
     dat_s_block_layout,
-    write_dat_s,
-    default_dat_s_path,
-    extract_sdpa_standard_solution,
-    build_symmetrized_parent_sdp,
-    solve_symmetrized_parent_sdp,
-    self_test
+    default_dat_s_path
+
 
 """
     Word{L}
@@ -612,18 +536,10 @@ The returned maps encode
     An * vec(Q) = e_empty,
     Am * vec(Q) - eta * e_selected = Ah * vec(K).
 
-The former implementation retained every evaluated abstract polynomial in two
-nested dictionaries while simultaneously assembling all three sparse matrices.
-For large outcome numbers this dominated memory.  The present routine instead:
+The routine first discovers the two equation supports, then assembles `An`, `Am`, and `Ah` in separate passes.
 
-  1. discovers the two equation supports and discards each evaluation;
-  2. assembles `An` in a second pass and releases its triplets;
-  3. assembles `Am` in a third pass and releases its triplets;
-  4. scans the marginal Gram pairs once more to assemble `Ah` directly.
-
-This repeats inexpensive degree-at-most-six polynomial evaluations, but it never
-keeps the large evaluation dictionaries or more than one triplet buffer alive.
-The exact marginal retraction basis is unchanged.
+The construction uses several passes so that the large polynomial dictionaries and sparse triplet buffers do not coexist.
+The resulting maps are exactly the same algebraic coefficient maps.
 """
 function build_coefficient_data(
     ::Type{T};
@@ -885,20 +801,14 @@ end
 
 All symmetry information for one universal-parent hierarchy instance.
 
-The field `data` is the coefficient data returned by
-`build_coefficient_data`.  `Q_decomposition` and
-`K_decomposition` are the stored reconstruction maps.  The remaining fields
-record the generator actions and the representative rows of the normalisation
-and marginal coefficient equations.
+The field `data` stores the coefficient metadata, while `Q_decomposition` and `K_decomposition` store the
+reconstruction maps. The remaining fields contain the representative rows and orbit labels used to reduce the
+normalisation and marginal equations.
 """
 struct ParentSymmetryReduction{T<:AbstractFloat,D}
     data::D
     Q_decomposition::SymmetryDecomposition{T}
     K_decomposition::SymmetryDecomposition{T}
-    normalisation_letter_generators::Vector{Vector{Int}}
-    marginal_letter_generators::Vector{Vector{Int}}
-    normalisation_basis_permutations::Vector{Vector{Int}}
-    marginal_basis_permutations::Vector{Vector{Int}}
     normalisation_orbit_representatives::Vector{Int}
     normalisation_orbit_id::Vector{Int}
     marginal_orbit_representatives::Vector{Int}
@@ -954,10 +864,6 @@ function compact_reduction(
         compact_data,
         reduction.Q_decomposition,
         reduction.K_decomposition,
-        reduction.normalisation_letter_generators,
-        reduction.marginal_letter_generators,
-        Vector{Vector{Int}}(),
-        Vector{Vector{Int}}(),
         Int[],
         Int[],
         Int[],
@@ -979,17 +885,6 @@ block_signature(decomposition::SymmetryDecomposition) = [
      irrep_dimension = component.irrep_dimension)
     for component in decomposition.components
 ]
-
-"""
-    full_isometry(decomposition)
-
-Concatenate all component isometries.  The result is an orthogonal `N × N`
-matrix, up to the numerical decomposition tolerance.
-"""
-function full_isometry(decomposition::SymmetryDecomposition{T}) where {T}
-    isempty(decomposition.components) && return zeros(T, decomposition.dimension, 0)
-    return hcat((component.isometry for component in decomposition.components)...)
-end
 
 # ---------------------------------------------------------------------------
 # Permutations and group generators
@@ -1075,10 +970,9 @@ end
 
 Generators of the stabiliser of one selected marginal.
 
-The selected concrete projector is fixed.  The other explicit outcomes of its
-setting are permuted by `S_(n-2)`.  Every non-selected setting has an
-independent `S_(n-1)` outcome action, and the non-selected settings are
-permuted by `S_(k-1)`.
+The selected concrete projector is fixed. On the exact retracted marginal basis the `S_(n-2)` action on the discarded
+outcomes of the selected setting is trivial, so only the effective action is generated: independent `S_(n-1)` outcome
+permutations on every non-selected setting, together with `S_(k-1)` permutations of those settings.
 """
 function marginal_generators(
     n::Int,
@@ -1098,16 +992,13 @@ function marginal_generators(
     nalphabet = k * nind
     generators = Vector{Vector{Int}}()
 
+    # The exact marginal retraction removes all non-selected letters of the selected setting, so the
+    # corresponding S_(n-2) factor acts trivially and need not be represented explicitly.
     for setting in 1:k
+        setting == selected_setting && continue
         base = (setting - 1) * nind
-        outcomes = setting == selected_setting ?
-            [a for a in 1:nind if a != selected_outcome] : collect(1:nind)
-        for position in 1:(length(outcomes) - 1)
-            push!(generators, transposition(
-                nalphabet,
-                base + outcomes[position],
-                base + outcomes[position + 1],
-            ))
+        for outcome in 1:(nind - 1)
+            push!(generators, transposition(nalphabet, base + outcome, base + outcome + 1))
         end
     end
 
@@ -1203,44 +1094,6 @@ function union_sets!(sets::DisjointSet, i::Int, j::Int)
         sets.rank[root_i] += 0x01
     end
     return sets
-end
-
-"""
-    orbit_partition(n, generator_permutations)
-
-Return `(representatives, orbit_id)` for the action generated by permutations
-of `1:n`.  `orbit_id[i]` is a one-based orbit number.  The representative is
-the smallest index in each orbit.
-"""
-function orbit_partition(
-    n::Int,
-    generator_permutations::AbstractVector{<:AbstractVector{Int}},
-)
-    sets = DisjointSet(n)
-    for permutation in generator_permutations
-        length(permutation) == n || throw(DimensionMismatch(
-            "generator has length $(length(permutation)), expected $n",
-        ))
-        for i in 1:n
-            union_sets!(sets, i, permutation[i])
-        end
-    end
-
-    root_to_members = Dict{Int,Vector{Int}}()
-    for i in 1:n
-        root = find_root!(sets, i)
-        push!(get!(root_to_members, root, Int[]), i)
-    end
-    orbits = collect(values(root_to_members))
-    foreach(sort!, orbits)
-    sort!(orbits; by = first)
-
-    representatives = [first(orbit) for orbit in orbits]
-    orbit_id = zeros(Int, n)
-    for (id, orbit) in enumerate(orbits), i in orbit
-        orbit_id[i] = id
-    end
-    return representatives, orbit_id
 end
 
 """
@@ -1436,31 +1289,6 @@ function cluster_eigenvalues(
     end
     push!(clusters, current)
     return clusters
-end
-
-"""
-    stable_svd(matrix; full=false)
-
-Compute an SVD using an algorithm appropriate for the scalar type.
-
-For BLAS/LAPACK scalars Julia's default divide-and-conquer driver is fast but
-can occasionally fail to converge (`gesdd`, LAPACKException).  The
-intertwining systems in this module are small, so the more robust QR-iteration
-driver (`gesvd`) is preferable.  Generic scalar types continue to use
-`GenericLinearAlgebra.svd`.
-"""
-function stable_svd(
-    matrix::AbstractMatrix{T};
-    full::Bool = false,
-) where {T<:AbstractFloat}
-    if T <: LinearAlgebra.BlasReal
-        return svd(
-            Matrix{T}(matrix);
-            full = full,
-            alg = LinearAlgebra.QRIteration(),
-        )
-    end
-    return svd(Matrix{T}(matrix); full = full)
 end
 
 """
@@ -1944,8 +1772,6 @@ Reconstruct the original invariant matrix from the reduced PSD blocks.
 
     X = sum_a U_a * kron(blocks[a], I_(r_a)) * U_a'.
 
-This is the central reconstruction routine that was missing from the original
-Python implementation.
 """
 function reconstruct_matrix(
     decomposition::SymmetryDecomposition{T},
@@ -2155,19 +1981,10 @@ function build_parent_symmetry_reduction(
         data.marginal_word_index,
         marginal_letter_generators,
     )
-    # Full equation-basis permutations can require several gigabytes and are not
-    # needed once the orbit partition is known.
-    normalisation_basis_actions = Vector{Vector{Int}}()
-    marginal_basis_actions = Vector{Vector{Int}}()
-
     reduction = ParentSymmetryReduction(
         data,
         Q_decomposition,
         K_decomposition,
-        normalisation_letter_generators,
-        marginal_letter_generators,
-        normalisation_basis_actions,
-        marginal_basis_actions,
         normalisation_representatives,
         normalisation_orbit_id,
         marginal_representatives,
@@ -2268,21 +2085,6 @@ function reduced_row_blocks(
         end
     end
     return blocks
-end
-
-"""Add `dot(coefficient, symmetric_variable)` to a JuMP affine expression."""
-function add_symmetric_block_dot!(
-    expression,
-    coefficient::AbstractMatrix{T},
-    variable,
-) where {T<:Real}
-    n = size(coefficient, 1)
-    size(coefficient, 2) == n || throw(DimensionMismatch("coefficient is not square"))
-    for j in 1:n, i in 1:j
-        value = i == j ? coefficient[i, j] : convert(T, 2) * coefficient[i, j]
-        iszero(value) || add_to_expression!(expression, value, variable[i, j])
-    end
-    return expression
 end
 
 """Return true when every numerical entry in a vector of matrices is zero."""
@@ -2464,7 +2266,8 @@ function write_dat_s(
             "}",
         )
 
-        # F_0 and the dual variable `mu` for the primal upper bound eta <= 1.
+        # SDPA uses sum_i x_i F_i - F_0 >= 0. Hence F_0 has +1 here, producing
+        # -sum_j tau_j z_j + mu - 1 >= 0 in the scalar eta block.
         println(
             io,
             "0 ",
@@ -2541,7 +2344,7 @@ function write_dat_s(
     )
 end
 
-"""Largest recorded numerical error in a stored symmetry reduction."""
+"""Largest validation residual recorded in a stored symmetry reduction."""
 function decomposition_error_scale(
     reduction::ParentSymmetryReduction{T},
 ) where {T<:AbstractFloat}
@@ -2553,7 +2356,6 @@ function decomposition_error_scale(
     for decomposition in decompositions
         value = max(
             value,
-            decomposition.tolerance,
             decomposition.orthogonality_error,
             decomposition.representation_error,
             decomposition.invariance_test_error,
@@ -2565,25 +2367,6 @@ function decomposition_error_scale(
     return value
 end
 
-"""
-    recommended_hypatia_rank_tolerance(reduction)
-
-Return a QR rank tolerance commensurate with the numerical symmetry reduction.
-
-Hypatia's default `init_tol_qr = 1000eps(T)` assumes that the affine data were
-formed directly at precision `T`.  Here they are obtained after numerical
-eigenvector and intertwiner calculations, so fixed multiprecision types can
-contain harmless equation noise many orders of magnitude above `eps(T)`.
-"""
-function recommended_hypatia_rank_tolerance(
-    reduction::ParentSymmetryReduction{T},
-) where {T<:AbstractFloat}
-    return max(
-        convert(T, 100) * decomposition_error_scale(reduction),
-        convert(T, 1_000) * eps(T),
-    )
-end
-
 function _has_raw_optimizer_attribute(attributes, name::AbstractString)
     return any(attributes) do attribute
         key = first(attribute)
@@ -2591,12 +2374,86 @@ function _has_raw_optimizer_attribute(attributes, name::AbstractString)
     end
 end
 
+"""Dimension of the unretracted concrete word basis of degree at most `t`."""
+function full_marginal_basis_dimension(n::Int, k::Int, t::Int)
+    n >= 2 || throw(ArgumentError("n must be at least 2"))
+    k >= 1 || throw(ArgumentError("k must be positive"))
+    t >= 0 || throw(ArgumentError("t must be nonnegative"))
+
+    dimension = 1
+    term = k * (n - 1)
+    continuation = (k - 1) * (n - 1)
+    for _ in 1:t
+        dimension += term
+        term *= continuation
+    end
+    return dimension
+end
+
+
 """
     default_dat_s_path(n, k, t)
 
 Return the default sparse-SDPA filename used by `build_symmetrized_parent_sdp` when `dat_s_path` is omitted.
 """
 default_dat_s_path(n::Int, k::Int, t::Int) = "parent_k$(k)_n$(n)_t$(t).dat-s"
+
+
+function _read_dat_s_model(
+    path::AbstractString,
+    ::Type{T};
+    optimizer = Hypatia.Optimizer{T},
+    optimizer_attributes = Pair[],
+    hypatia_rank_tolerance::Union{Nothing,Real} = nothing,
+    silent::Bool = false,
+) where {T<:AbstractFloat}
+    rank_tolerance = isnothing(hypatia_rank_tolerance) ? nothing : convert(T, hypatia_rank_tolerance)
+    if !isnothing(rank_tolerance)
+        optimizer === Hypatia.Optimizer{T} || throw(ArgumentError("hypatia_rank_tolerance is only valid with Hypatia"))
+        rank_tolerance > zero(T) || throw(ArgumentError("hypatia_rank_tolerance must be positive"))
+    end
+
+    model = read_from_file(path; coefficient_type = T)
+    set_optimizer(model, optimizer)
+    silent && set_silent(model)
+
+    if !isnothing(rank_tolerance)
+        _has_raw_optimizer_attribute(optimizer_attributes, "init_tol_qr") || set_optimizer_attribute(model, "init_tol_qr", rank_tolerance)
+        _has_raw_optimizer_attribute(optimizer_attributes, "tol_inconsistent") || set_optimizer_attribute(model, "tol_inconsistent", rank_tolerance)
+    end
+    for attribute in optimizer_attributes
+        set_optimizer_attribute(model, first(attribute), last(attribute))
+    end
+    return model
+end
+
+"""
+    solve_dat_s(path, T=Float64; kwargs...)
+
+Read and solve an existing sparse-SDPA file without rebuilding the SOS hierarchy. The return value is the JuMP model,
+so `objective_value(model)` gives the optimum of the geometric-form problem stored in the file.
+"""
+function solve_dat_s(
+    path::AbstractString,
+    ::Type{T} = Float64;
+    optimizer = Hypatia.Optimizer{T},
+    optimizer_attributes = Pair[],
+    hypatia_rank_tolerance::Union{Nothing,Real} = nothing,
+    silent::Bool = false,
+    verbose::Bool = true,
+) where {T<:AbstractFloat}
+    model = _read_dat_s_model(
+        path,
+        T;
+        optimizer = optimizer,
+        optimizer_attributes = optimizer_attributes,
+        hypatia_rank_tolerance = hypatia_rank_tolerance,
+        silent = silent,
+    )
+    optimize!(model)
+    verbose && println(solution_summary(model))
+    return model
+end
 
 """
     build_symmetrized_parent_sdp(T=Float64; reduction=nothing, kwargs...)
@@ -2652,14 +2509,7 @@ function build_symmetrized_parent_sdp(
 
     data = actual_reduction.data
     cleanup = isnothing(coefficient_cleanup_tolerance) ? zero(T) : convert(T, coefficient_cleanup_tolerance)
-    using_hypatia = optimizer === Hypatia.Optimizer{T}
-    if !using_hypatia && !isnothing(hypatia_rank_tolerance)
-        throw(ArgumentError("hypatia_rank_tolerance is only valid with Hypatia.Optimizer{T}"))
-    end
     rank_tolerance = isnothing(hypatia_rank_tolerance) ? nothing : convert(T, hypatia_rank_tolerance)
-    if !isnothing(rank_tolerance)
-        rank_tolerance > zero(T) || throw(ArgumentError("hypatia_rank_tolerance must be positive"))
-    end
 
     normalisation_equations = ReducedNormalisationEquation{T}[]
     marginal_equations = ReducedMarginalEquation{T}[]
@@ -2748,28 +2598,36 @@ function build_symmetrized_parent_sdp(
         )
     end
 
+    statistics = (
+        n = data.n,
+        k = data.k,
+        t = data.t,
+        parent_dimension = actual_reduction.Q_decomposition.dimension,
+        parent_largest_block = maximum(component.multiplicity for component in actual_reduction.Q_decomposition.components),
+        marginal_full_dimension = full_marginal_basis_dimension(data.n, data.k, data.t),
+        marginal_sieved_dimension = actual_reduction.K_decomposition.dimension,
+        marginal_largest_block = maximum(component.multiplicity for component in actual_reduction.K_decomposition.components),
+        normalisation_equations_before = length(data.normalisation_words),
+        normalisation_equations_after = length(normalisation_equations),
+        marginal_equations_before = length(data.marginal_words),
+        marginal_equations_after = length(marginal_equations),
+    )
+
     if !retain_unreduced_data
         actual_reduction = returned_reduction
         data = nothing
         GC.gc()
     end
 
-    model = read_from_file(resolved_dat_s_path; coefficient_type = T)
-    set_optimizer(model, optimizer)
-    silent && set_silent(model)
-
-    if !isnothing(rank_tolerance)
-        if !_has_raw_optimizer_attribute(optimizer_attributes, "init_tol_qr")
-            set_optimizer_attribute(model, "init_tol_qr", rank_tolerance)
-        end
-        if !_has_raw_optimizer_attribute(optimizer_attributes, "tol_inconsistent")
-            set_optimizer_attribute(model, "tol_inconsistent", rank_tolerance)
-        end
-        verbose && println("Using explicit Hypatia equality-rank tolerance ", rank_tolerance, ".")
-    end
-    for attribute in optimizer_attributes
-        set_optimizer_attribute(model, first(attribute), last(attribute))
-    end
+    model = _read_dat_s_model(
+        resolved_dat_s_path,
+        T;
+        optimizer = optimizer,
+        optimizer_attributes = optimizer_attributes,
+        hypatia_rank_tolerance = rank_tolerance,
+        silent = silent,
+    )
+    !isnothing(rank_tolerance) && verbose && println("Using explicit Hypatia equality-rank tolerance ", rank_tolerance, ".")
 
     verbose && println(
         "SDPA model ready: ",
@@ -2795,6 +2653,7 @@ function build_symmetrized_parent_sdp(
         marginal_equations = marginal_equations,
         dat_s_path = resolved_dat_s_path,
         dat_s_layout = dat_s_block_layout(returned_reduction),
+        statistics = statistics,
         save_reduction_path = save_reduction_path,
         retain_unreduced_data = retain_unreduced_data,
         solver_formulation = :sdpa_geometric_dual,
@@ -2846,6 +2705,14 @@ function extract_sdpa_standard_solution(problem)
     length(nonnegative_indices) == 2 || error(
         "the SDPA reader returned $(length(nonnegative_indices)) nonnegative blocks, expected the eta and 1-eta blocks",
     )
+
+    actual_psd_sizes = [MOI.get(moi_model, MOI.ConstraintSet(), index).side_dimension for index in psd_indices]
+    expected_psd_sizes = vcat(q_sizes, k_sizes)
+    actual_psd_sizes == expected_psd_sizes || error(
+        "the SDPA reader changed the PSD block order: got $actual_psd_sizes, expected $expected_psd_sizes",
+    )
+    all(MOI.get(moi_model, MOI.ConstraintSet(), index).dimension == 1 for index in nonnegative_indices) ||
+        error("the eta and eta-slack SDPA blocks are not scalar")
 
     psd_duals = [MOI.get(moi_model, MOI.ConstraintDual(), index) for index in psd_indices]
     q_count = length(q_sizes)
@@ -3071,19 +2938,19 @@ end
 """
     solve_symmetrized_parent_sdp(T=Float64; kwargs...)
 
-Build, export, reload, and solve the symmetry-reduced hierarchy. The solver model is the geometric-form dual read from
-the generated `.dat-s` file. The original reduced Gram blocks and `eta` are recovered from the conic dual solution.
+Build, export, reload, and solve the symmetry-reduced hierarchy. The solver model is the geometric-form dual stored in
+the generated `.dat-s` file; the reduced Gram blocks and `eta` are recovered from its conic dual solution.
 """
 function solve_symmetrized_parent_sdp(
     ::Type{T} = Float64;
     save_path::Union{Nothing,AbstractString} = nothing,
-    reference_eta = nothing,
+    verbose::Bool = true,
     kwargs...,
 ) where {T<:AbstractFloat}
-    problem = build_symmetrized_parent_sdp(T; kwargs...)
+    problem = build_symmetrized_parent_sdp(T; verbose = verbose, kwargs...)
     GC.gc()
     optimize!(problem.model)
-    println(solution_summary(problem.model))
+    verbose && println(solution_summary(problem.model))
 
     standard_status = dual_status(problem.model)
     if !has_duals(problem.model) || !(standard_status in (MOI.FEASIBLE_POINT, MOI.NEARLY_FEASIBLE_POINT))
@@ -3111,7 +2978,6 @@ function solve_symmetrized_parent_sdp(
     eta_value = extracted.eta
     eta_slack_value = extracted.eta_slack
 
-    Q, K = reconstruct_gram_matrices(problem.reduction, Q_block_values, K_block_values)
     data = problem.reduction.data
     reduced_residuals = reduced_equation_residuals(
         problem.normalisation_equations,
@@ -3122,19 +2988,6 @@ function solve_symmetrized_parent_sdp(
     )
     normalisation_residual = reduced_residuals.normalisation
     marginal_residual = reduced_residuals.marginal
-
-    Q_compression = compress_matrix(problem.reduction.Q_decomposition, Q)
-    K_compression = compress_matrix(problem.reduction.K_decomposition, K)
-    Q_roundtrip = maximum(
-        isempty(Q_block_values) ? T[zero(T)] : [
-            opnorm(a - b, Inf) for (a, b) in zip(Q_block_values, Q_compression.blocks)
-        ],
-    )
-    K_roundtrip = maximum(
-        isempty(K_block_values) ? T[zero(T)] : [
-            opnorm(a - b, Inf) for (a, b) in zip(K_block_values, K_compression.blocks)
-        ],
-    )
 
     minimum_eigenvalue_Q_blocks = [eigmin(block) for block in Q_block_values]
     minimum_eigenvalue_K_blocks = [eigmin(block) for block in K_block_values]
@@ -3154,38 +3007,29 @@ function solve_symmetrized_parent_sdp(
         minimum_eigenvalue_K_blocks = minimum_eigenvalue_K_blocks,
         maximum_normalisation_residual = isempty(normalisation_residual) ? zero(T) : maximum(abs, normalisation_residual),
         maximum_marginal_residual = isempty(marginal_residual) ? zero(T) : maximum(abs, marginal_residual),
-        Q_structure_error = Q_compression.structure_error,
-        K_structure_error = K_compression.structure_error,
-        Q_block_roundtrip_error = Q_roundtrip,
-        K_block_roundtrip_error = K_roundtrip,
+        symmetry_decomposition_error = decomposition_error_scale(problem.reduction),
         termination_status = termination_status(problem.model),
         geometric_primal_status = primal_status(problem.model),
         standard_primal_status = dual_status(problem.model),
     )
 
-    println("eta                         = ", diagnostics.eta)
-    println("eta slack                   = ", diagnostics.eta_slack)
-    println("eta + slack - 1             = ", diagnostics.eta_plus_slack_error)
-    println("SDPA objective - eta        = ", diagnostics.geometric_objective_minus_eta)
-    if !isnothing(reference_eta)
-        reference = convert(T, reference_eta)
-        println("reference eta               = ", reference)
-        println("reference - eta             = ", reference - eta_value)
+    if verbose
+        println("eta                         = ", diagnostics.eta)
+        println("eta slack                   = ", diagnostics.eta_slack)
+        println("eta + slack - 1             = ", diagnostics.eta_plus_slack_error)
+        println("SDPA objective - eta        = ", diagnostics.geometric_objective_minus_eta)
+        println("minimum eigenvalue of Q     = ", diagnostics.minimum_eigenvalue_Q)
+        println("minimum eigenvalue of K     = ", diagnostics.minimum_eigenvalue_K)
+        println("max normalisation residual  = ", diagnostics.maximum_normalisation_residual)
+        println("max marginal residual       = ", diagnostics.maximum_marginal_residual)
+        println("symmetry decomposition err. = ", diagnostics.symmetry_decomposition_error)
     end
-    println("minimum eigenvalue of Q     = ", diagnostics.minimum_eigenvalue_Q)
-    println("minimum eigenvalue of K     = ", diagnostics.minimum_eigenvalue_K)
-    println("max normalisation residual  = ", diagnostics.maximum_normalisation_residual)
-    println("max marginal residual       = ", diagnostics.maximum_marginal_residual)
-    println("Q reconstruction roundtrip  = ", diagnostics.Q_block_roundtrip_error)
-    println("K reconstruction roundtrip  = ", diagnostics.K_block_roundtrip_error)
 
     result = (
         eta = eta_value,
         eta_slack = eta_slack_value,
         Q_blocks = Q_block_values,
         K_blocks = K_block_values,
-        Q = Q,
-        K = K,
         diagnostics = diagnostics,
         Q_block_signature = block_signature(problem.reduction.Q_decomposition),
         K_block_signature = block_signature(problem.reduction.K_decomposition),
@@ -3199,96 +3043,9 @@ function solve_symmetrized_parent_sdp(
         open(save_path, "w") do io
             serialize(io, payload)
         end
-        println("Saved reduced blocks and reconstruction map to ", save_path)
+        verbose && println("Saved reduced blocks and reconstruction map to ", save_path)
     end
     return merge(problem, (result = result,))
 end
-
-"""
-    self_test(; exhaustive=false, verbose=true)
-
-Run combinatorial, decomposition, and reconstruction checks without invoking an
-SDP solver.  The default test verifies the length-parametric `Word` operations,
-the exact marginal-basis counts, and a small reconstruction round trip.
-
-With `exhaustive=true`, the test additionally reproduces the exact
-`(n,k,t)=(4,3,3)` block structures
-
-    Q: 7, 5, 3,
-    K: 20, 14, 12, 7, 7, 2, 1.
-
-The former unsieved 388-word basis is deliberately not constructed anywhere in
-this module.
-"""
-function self_test(; exhaustive::Bool = false, verbose::Bool = true)
-    @assert Word() isa Word{0}
-    @assert Word(1, 2, 3) isa Word{3}
-    @assert append_letter(Word(1, 2), 3) isa Word{3}
-    @assert concatenate(Word(1, 2), Word(3, 4)) isa Word{4}
-    @assert reverse(Word(1, 2, 3)) == Word(3, 2, 1)
-    @assert Dict(Word(1, 2) => 7)[Word(1, 2)] == 7
-
-    # Exact sieve sizes quoted in the numerical experiments.
-    @assert length(marginal_residual_basis(3, 3, 2)) == 22
-    @assert length(marginal_residual_basis(4, 3, 2)) == 38
-    @assert length(marginal_residual_basis(3, 3, 3)) == 74
-    @assert length(marginal_residual_basis(4, 3, 3)) == 170
-
-    T = Float64
-    q_words = abstract_words(3, 2)
-    q_decomposition = decompose_permutation_representation(
-        T,
-        q_words,
-        setting_generators(3);
-        seed = 31415,
-        verbose = verbose,
-    )
-    @assert sum(
-        component.multiplicity * component.irrep_dimension
-        for component in q_decomposition.components
-    ) == length(q_words)
-
-    rng = MersenneTwister(2718)
-    blocks = Matrix{T}[]
-    for component in q_decomposition.components
-        raw = randn(rng, component.multiplicity, component.multiplicity)
-        push!(blocks, raw * transpose(raw))
-    end
-    matrix = reconstruct_matrix(q_decomposition, blocks)
-    compressed = compress_matrix(q_decomposition, matrix)
-    @assert compressed.structure_error < 1e-6
-    @assert maximum(opnorm(a - b, Inf) for (a, b) in zip(blocks, compressed.blocks)) < 1e-6
-
-    if exhaustive
-        q_words = abstract_words(3, 3)
-        q = decompose_permutation_representation(
-            T,
-            q_words,
-            setting_generators(3);
-            seed = 1234,
-            verbose = verbose,
-        )
-        @assert [component.multiplicity for component in q.components] == [7, 5, 3]
-        @assert [component.irrep_dimension for component in q.components] == [2, 1, 1]
-
-        k_words = marginal_residual_basis(4, 3, 3)
-        @assert length(k_words) == 170
-        k_decomposition = decompose_permutation_representation(
-            T,
-            k_words,
-            marginal_generators(4, 3);
-            seed = 9012,
-            verbose = verbose,
-        )
-        @assert [component.multiplicity for component in k_decomposition.components] ==
-            [20, 14, 12, 7, 7, 2, 1]
-        @assert [component.irrep_dimension for component in k_decomposition.components] ==
-            [4, 1, 1, 4, 4, 2, 4]
-    end
-
-    println("All SymmetrizedParentSOS self-tests passed.")
-    return true
-end
-
 
 end # module SymmetrizedParentSOS
