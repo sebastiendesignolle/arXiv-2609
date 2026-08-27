@@ -32,10 +32,10 @@ The main solver is Hypatia. The high-precision example uses `MultiFloats.jl`, wh
 The routine numerical script accepts the hierarchy levels to run as command-line arguments. For example,
 
 ```bash
-julia --project reproduce_numerics.jl 1 2 3
+julia --project reproduce_numerics.jl 1 2
 ```
 
-runs the cases used in the article at levels 1-3. Level 4 can be run separately with
+runs the cases used in the article at levels 1-2. Level 3 and 4 can be run separately with, for instance,
 
 ```bash
 julia --project reproduce_numerics.jl 4
@@ -76,16 +76,10 @@ problem. A different floating-point type can be supplied as the second argument.
 Run
 
 ```bash
-julia --project reproduce_k3_n4_high_precision.jl
+julia --project reproduce_k3_n4_high_precision.jl parent_k3_n4_t3_x4.dat-s
 ```
 
-to solve `results/dat-s/parent_k3_n4_t3_x4.dat-s` with `Float64x4` and compare the numerical value with
-`(1 + cos(π/9))/3`. If the file is absent, the script first generates it. An explicit path may instead be supplied as the
-first argument:
-
-```bash
-julia --project reproduce_k3_n4_high_precision.jl /path/to/parent_k3_n4_t3_x4.dat-s
-```
+to solve `parent_k3_n4_t3_x4.dat-s` with `Float64x4` and compare the numerical value with `(1 + cos(π/9))/3`.
 
 ## Using the module directly
 
